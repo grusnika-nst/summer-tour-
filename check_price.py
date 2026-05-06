@@ -6,7 +6,6 @@ import requests
 from datetime import datetime
 from playwright.async_api import async_playwright
 
-# Настройки из GitHub Secrets
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TOUR_URL = "https://alatantour.by/#tvtourid=6847006619"
@@ -14,7 +13,7 @@ PRICE_FILE = "prices.json"
 
 
 async def get_tour_price():
-    """Открывает страницу и парсит цену"""
+    """Открывает страницу и ждёт загрузки виджета тура"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -28,36 +27,50 @@ async def get_tour_price():
         page = await context.new_page()
 
         print(f"Открываю: {TOUR_URL}")
-        await page.goto(TOUR_URL, timeout=60000)
+        await page.goto(TOUR_URL, wait_until="networkidle",
+                        timeout=60000)
 
-        # Ждём загрузки виджета TourVisor
-        print("Жду загрузки виджета...")
-        await page.wait_for_timeout(15000)
+        # Ждём загрузки основной страницы
+        print("Жду загрузки страницы...")
+        await page.wait_for_timeout(5000)
 
-        # Скриншот для отладки
+        # Принудительно обрабатываем хэш — TourVisor виджет
+        # Иногда нужно заново установить хэш
+        await page.evaluate("""
+            window.location.hash = 'tvtourid=6847006619';
+            window.dispatchEvent(new HashChangeEvent('hashchange'));
+        """)
+
+        # Ждём появления всплывающего окна тура
+        print("Жду открытия карточки тура...")
+        await page.wait_for_timeout(20000)
+
+        # Скриншот
         await page.screenshot(path="screenshot.png", full_page=True)
         print("Скриншот сохранён")
 
-        # Получаем весь текст страницы
+        # Получаем HTML
         content = await page.content()
-
-        # Сохраняем HTML для отладки
         with open("debug_page.html", "w", encoding="utf-8") as f:
             f.write(content)
 
-        # Ищем цену — пробуем разные селекторы TourVisor
+        # Ищем цену в модальном окне / оверлее тура
         price = None
 
-        # Способ 1: селекторы
+        # Способ 1: ищем во всплывающем окне TourVisor
         selectors = [
-            "[class*='price'] [class*='val']",
-            "[class*='price']",
-            "[class*='Price']",
-            "[class*='cost']",
-            "[class*='sum']",
-            ".tv-tour-price",
-            ".tour_price",
-            "[class*='tour'] [class*='price']",
+            ".tv-tour-page-price",
+            ".tv-tour-info-price",
+            ".tv-modal [class*='price']",
+            ".tv-popup [class*='price']",
+            "[class*='tvtour'] [class*='price']",
+            "[class*='tour-card'] [class*='price']",
+            "[class*='overlay'] [class*='price']",
+            "[class*='modal'] [class*='price']",
+            "[class*='popup'] [class*='price']",
+            ".tv-cost",
+            "[class*='tv-'] [class*='price']",
+            "[class*='tv-'] [class*='cost']",
         ]
 
         for selector in selectors:
@@ -67,44 +80,66 @@ async def get_tour_price():
                     text = await el.text_content()
                     if text:
                         digits = re.sub(r'\D', '', text.strip())
-                        if digits and 100 < int(digits) < 100000:
+                        if digits and 200 < int(digits) < 500000:
                             price = int(digits)
-                            print(f"Цена найдена селектором "
-                                  f"'{selector}': {price}")
+                            print(f"Найдено '{selector}': "
+                                  f"{text.strip()} → {price}")
                             break
             except Exception:
                 continue
             if price:
                 break
 
-        # Способ 2: регулярные выражения по HTML
+        # Способ 2: ищем все элементы с ценой на странице
         if not price:
+            print("Селекторы не помогли, ищу по всем элементам...")
+            all_elements = await page.query_selector_all("*")
+            for el in all_elements[:500]:
+                try:
+                    text = await el.text_content()
+                    if text and re.search(
+                        r'\d[\d\s]*\d\s*(?:USD|BYN|\$|€)',
+                        text.strip()[:50]
+                    ):
+                        digits = re.sub(r'\D', '', text.strip()[:20])
+                        if digits and 200 < int(digits) < 500000:
+                            price = int(digits)
+                            print(f"Найдено в тексте: {text.strip()[:50]} → {price}")
+                            break
+                except Exception:
+                    continue
+
+        # Способ 3: регулярные выражения по HTML
+        if not price:
+            print("Ищу по HTML регулярными выражениями...")
             patterns = [
-                r'(\d[\d\s]{2,8}\d)\s*(?:USD|usd|\$|долл)',
-                r'(\d[\d\s]{2,8}\d)\s*(?:BYN|byn|руб|р\.)',
-                r'(?:цена|price|стоимость)[^\d]{0,30}(\d[\d\s]{2,8}\d)',
-                r'(?:от\s*)(\d[\d\s]{2,8}\d)',
+                r'(\d[\d\s]{2,8}\d)\s*(?:USD|usd|\$)',
+                r'(\d[\d\s]{2,8}\d)\s*(?:BYN|byn)',
+                r'(?:итого|total|цена|price)[^\d]{0,50}(\d[\d\s]{2,8}\d)',
             ]
             for pattern in patterns:
-                match = re.search(pattern, content, re.IGNORECASE)
-                if match:
-                    digits = re.sub(r'\D', '', match.group(1))
-                    if digits and 100 < int(digits) < 100000:
+                matches = re.findall(pattern, content, re.IGNORECASE)
+                for match in matches:
+                    digits = re.sub(r'\D', '', match)
+                    if digits and 200 < int(digits) < 500000:
                         price = int(digits)
-                        print(f"Цена найдена регулярным "
-                              f"выражением: {price}")
+                        print(f"Регулярное выражение: {price}")
                         break
+                if price:
+                    break
+
+        # Способ 4: ищем в сетевых запросах (API TourVisor)
+        if not price:
+            print("Цена не найдена на странице")
 
         await browser.close()
         return price
 
 
 def send_telegram(message):
-    """Отправка сообщения в Telegram"""
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram не настроен!")
         return
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     resp = requests.post(url, json={
         "chat_id": CHAT_ID,
@@ -112,16 +147,14 @@ def send_telegram(message):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     })
-    print(f"Telegram ответ: {resp.status_code}")
+    print(f"Telegram: {resp.status_code}")
 
 
 def send_telegram_photo(photo_path, caption=""):
-    """Отправка фото в Telegram"""
     if not BOT_TOKEN or not CHAT_ID:
         return
     if not os.path.exists(photo_path):
         return
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     with open(photo_path, "rb") as photo:
         requests.post(url, data={
@@ -132,7 +165,6 @@ def send_telegram_photo(photo_path, caption=""):
 
 
 def load_prices():
-    """Загрузка истории цен"""
     if os.path.exists(PRICE_FILE):
         with open(PRICE_FILE, "r") as f:
             return json.load(f)
@@ -140,87 +172,69 @@ def load_prices():
 
 
 def save_prices(data):
-    """Сохранение истории цен"""
     with open(PRICE_FILE, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 async def main():
     print(f"\n{'='*50}")
-    print(f"Проверка цены: {datetime.now()}")
+    print(f"Проверка: {datetime.now()}")
     print(f"{'='*50}\n")
 
-    # Получаем текущую цену
     try:
         current_price = await get_tour_price()
     except Exception as e:
         print(f"ОШИБКА: {e}")
-        send_telegram(f"⚠️ Ошибка мониторинга:\n\n{str(e)[:200]}")
+        send_telegram(f"⚠️ Ошибка:\n{str(e)[:300]}")
         return
 
     if current_price is None:
-        print("Цена не найдена!")
         send_telegram(
-            "⚠️ Не удалось найти цену на странице.\n"
-            "Возможно, сайт изменился или тур недоступен.\n\n"
+            "⚠️ Не удалось найти цену тура.\n"
+            "Карточка тура не загрузилась.\n\n"
             f"🔗 {TOUR_URL}"
         )
-        send_telegram_photo("screenshot.png", "Скриншот страницы")
+        send_telegram_photo("screenshot.png",
+                           "Скриншот — карточка тура не открылась")
         return
 
-    # Загружаем историю
     history = load_prices()
 
     if history["prices"]:
-        last_entry = history["prices"][-1]
-        last_price = last_entry["price"]
+        last_price = history["prices"][-1]["price"]
         diff = current_price - last_price
 
         if diff != 0:
-            if diff < 0:
-                emoji = "📉🔥"
-                status = "ПОДЕШЕВЕЛО!"
-            else:
-                emoji = "📈"
-                status = "Подорожало"
-
+            emoji = "📉🔥 ПОДЕШЕВЕЛО!" if diff < 0 \
+                else "📈 Подорожало"
             message = (
-                f"{emoji} <b>{status}</b>\n\n"
+                f"{emoji}\n\n"
                 f"🏨 Тур на alatantour.by\n"
-                f"━━━━━━━━━━━━━━━\n"
                 f"Было: {last_price:,}\n"
                 f"Стало: <b>{current_price:,}</b>\n"
-                f"Разница: <b>{diff:+,}</b>\n"
-                f"━━━━━━━━━━━━━━━\n\n"
+                f"Разница: <b>{diff:+,}</b>\n\n"
                 f"🔗 <a href='{TOUR_URL}'>Открыть тур</a>"
             )
             send_telegram(message)
-            print(f"Цена изменилась: {last_price} → {current_price}")
         else:
-            print(f"Цена не изменилась: {current_price}")
+            print(f"Цена та же: {current_price}")
     else:
-        # Первый запуск
         message = (
             f"✅ Мониторинг запущен!\n\n"
             f"🏨 Тур на alatantour.by\n"
             f"Текущая цена: <b>{current_price:,}</b>\n\n"
-            f"Буду проверять каждые 30 минут "
-            f"и сообщу если изменится.\n\n"
+            f"Проверяю каждые 30 минут.\n\n"
             f"🔗 <a href='{TOUR_URL}'>Открыть тур</a>"
         )
         send_telegram(message)
-        send_telegram_photo("screenshot.png",
-                           "📸 Так выглядит страница")
-        print(f"Первый запуск. Цена: {current_price}")
+        send_telegram_photo("screenshot.png", "📸 Страница тура")
 
-    # Сохраняем
     history["prices"].append({
         "price": current_price,
         "timestamp": datetime.now().isoformat()
     })
     history["prices"] = history["prices"][-500:]
     save_prices(history)
-
     print("Готово!")
 
 
