@@ -10,7 +10,7 @@ on:
 
 jobs:
   check-price:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     
     # Разрешаем записывать в репозиторий
     permissions:
