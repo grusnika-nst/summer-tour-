@@ -1,0 +1,58 @@
+name: Check Tour Price
+
+on:
+  schedule:
+    # Каждые 30 минут
+    - cron: '*/30 * * * *'
+  
+  # Возможность запустить вручную
+  workflow_dispatch:
+
+jobs:
+  check-price:
+    runs-on: ubuntu-latest
+    
+    # Разрешаем записывать в репозиторий
+    permissions:
+      contents: write
+
+    steps:
+      # 1. Скачиваем код
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Устанавливаем Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 3. Кэшируем зависимости (ускоряет запуск)
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      # 4. Устанавливаем зависимости
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps
+
+      # 5. Запускаем скрипт
+      - name: Run price check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python check_price.py
+
+      # 6. Сохраняем обновлённые цены в репозиторий
+      - name: Save price history
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add prices.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update prices $(date -u +'%Y-%m-%d %H:%M')"
+          git push
