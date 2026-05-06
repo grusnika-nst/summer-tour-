@@ -7,7 +7,9 @@ on:
 
 jobs:
   check-price:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.42.0-jammy
 
     permissions:
       contents: write
@@ -16,18 +18,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install playwright
-          playwright install chromium
-          sudo apt-get update
-          sudo apt-get install -y libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0 libxshmfence1
 
       - name: Run price check
         env:
@@ -37,6 +30,7 @@ jobs:
 
       - name: Save price history
         run: |
+          git config --global --add safe.directory /__w/summer-tour-/summer-tour-
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add prices.json
