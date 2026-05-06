@@ -27,7 +27,7 @@ async def get_tour_price():
         page = await context.new_page()
 
         print(f"Открываю: {TOUR_URL}")
-        await page.goto(TOUR_URL, wait_until="networkidle",
+               await page.goto(TOUR_URL, wait_until="domcontentloaded",
                         timeout=60000)
 
         # Ждём загрузки основной страницы
