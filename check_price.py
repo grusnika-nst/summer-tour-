@@ -13,6 +13,8 @@ PRICE_FILE = "prices.json"
 
 
 async def get_tour_price():
+    tour_data = {}
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -21,70 +23,93 @@ async def get_tour_price():
         )
         page = await context.new_page()
 
+        # Перехватываем ВСЕ ответы от сервера
+        async def handle_response(response):
+            url = response.url
+            if "tourvisor" in url or "tour" in url.lower():
+                try:
+                    if "json" in (response.headers.get("content-type", "") or ""):
+                        body = await response.json()
+                        tour_data[url] = body
+                        print(f"Перехвачен JSON: {url[:100]}")
+                    else:
+                        text = await response.text()
+                        if "price" in text.lower() or "cost" in text.lower():
+                            tour_data[url] = text[:2000]
+                            print(f"Перехвачен ответ: {url[:100]}")
+                except Exception:
+                    pass
+
+        page.on("response", handle_response)
+
         print(f"Открываю: {TOUR_URL}")
         await page.goto(TOUR_URL, wait_until="domcontentloaded", timeout=60000)
 
         print("Жду загрузки...")
         await page.wait_for_timeout(5000)
 
+        # Пробуем активировать виджет
         await page.evaluate("window.location.hash = 'tvtourid=6847006619'; window.dispatchEvent(new HashChangeEvent('hashchange'));")
 
-        print("Жду карточку тура...")
+        print("Жду API-ответов...")
         await page.wait_for_timeout(20000)
 
         await page.screenshot(path="screenshot.png", full_page=True)
-        print("Скриншот сохранён")
 
-        content = await page.content()
-        with open("debug_page.html", "w", encoding="utf-8") as f:
-            f.write(content)
+        # Сохраняем все перехваченные данные
+        with open("api_responses.json", "w", encoding="utf-8") as f:
+            json.dump(tour_data, f, indent=2, ensure_ascii=False, default=str)
 
+        print(f"\nПерехвачено ответов: {len(tour_data)}")
+
+        # Ищем цену в перехваченных данных
         price = None
+        for url, data in tour_data.items():
+            data_str = json.dumps(data) if isinstance(data, dict) else str(data)
+            print(f"\nURL: {url[:100]}")
+            print(f"Данные (фрагмент): {data_str[:300]}")
 
-        selectors = [
-            ".tv-tour-page-price",
-            ".tv-tour-info-price",
-            ".tv-modal [class*='price']",
-            ".tv-popup [class*='price']",
-            "[class*='tvtour'] [class*='price']",
-            "[class*='tour-card'] [class*='price']",
-            "[class*='overlay'] [class*='price']",
-            "[class*='modal'] [class*='price']",
-            "[class*='popup'] [class*='price']",
-            "[class*='tv-'] [class*='price']",
-            "[class*='tv-'] [class*='cost']",
-            "[class*='price']",
-        ]
-
-        for selector in selectors:
-            try:
-                elements = await page.query_selector_all(selector)
-                for el in elements:
-                    text = await el.text_content()
-                    if text:
-                        digits = re.sub(r'\D', '', text.strip())
-                        if digits and 200 < int(digits) < 500000:
-                            price = int(digits)
-                            print(f"Найдено '{selector}': {text.strip()} = {price}")
-                            break
-            except Exception:
-                continue
+            # Ищем цену в JSON
+            price_patterns = [
+                r'"price"\s*:\s*"?(\d+)"?',
+                r'"cost"\s*:\s*"?(\d+)"?',
+                r'"total"\s*:\s*"?(\d+)"?',
+                r'"priceUsd"\s*:\s*"?(\d+)"?',
+                r'"priceByn"\s*:\s*"?(\d+)"?',
+                r'"amount"\s*:\s*"?(\d+)"?',
+            ]
+            for pattern in price_patterns:
+                match = re.search(pattern, data_str, re.IGNORECASE)
+                if match:
+                    found = int(match.group(1))
+                    if 200 < found < 500000:
+                        price = found
+                        print(f"ЦЕНА НАЙДЕНА: {price} (из {url[:60]})")
+                        break
             if price:
                 break
 
+        # Если в API не нашли — ищем на странице
         if not price:
+            print("\nВ API не нашли, ищем на странице...")
+            content = await page.content()
+
+            # Ищем элементы с ценой в открытой карточке
+            all_text = await page.evaluate("document.body.innerText")
+            print(f"Текст страницы (фрагмент): {all_text[:500]}")
+
+            # Ищем паттерн цены
             patterns = [
                 r'(\d[\d\s]{2,8}\d)\s*(?:USD|usd|\$)',
                 r'(\d[\d\s]{2,8}\d)\s*(?:BYN|byn)',
-                r'(?:итого|total|цена|price)[^\d]{0,50}(\d[\d\s]{2,8}\d)',
             ]
             for pattern in patterns:
-                matches = re.findall(pattern, content, re.IGNORECASE)
+                matches = re.findall(pattern, all_text)
                 for match in matches:
                     digits = re.sub(r'\D', '', match)
-                    if digits and 200 < int(digits) < 500000:
+                    if digits and 500 < int(digits) < 500000:
                         price = int(digits)
-                        print(f"Regex: {price}")
+                        print(f"Найдено на странице: {price}")
                         break
                 if price:
                     break
@@ -133,23 +158,26 @@ async def main():
         return
 
     if current_price is None:
-        send_telegram("⚠️ Не удалось найти цену тура. Карточка не загрузилась.")
-        send_telegram_photo("screenshot.png", "Скриншот страницы")
+        send_telegram("⚠️ Не удалось найти цену тура.\nНи в API, ни на странице.")
+        send_telegram_photo("screenshot.png", "Скриншот")
         return
 
     history = load_prices()
+
+    # Сбрасываем историю (т.к. раньше была неправильная цена)
+    if history["prices"] and history["prices"][-1]["price"] == 2900:
+        history["prices"] = []
 
     if history["prices"]:
         last_price = history["prices"][-1]["price"]
         diff = current_price - last_price
         if diff != 0:
             emoji = "📉🔥 ПОДЕШЕВЕЛО!" if diff < 0 else "📈 Подорожало"
-            message = f"{emoji}\n\nБыло: {last_price:,}\nСтало: {current_price:,}\nРазница: {diff:+,}\n\n🔗 <a href='{TOUR_URL}'>Открыть тур</a>"
-            send_telegram(message)
+            send_telegram(f"{emoji}\n\nБыло: {last_price:,}\nСтало: {current_price:,}\nРазница: {diff:+,}\n\n🔗 <a href='{TOUR_URL}'>Открыть тур</a>")
         else:
             print(f"Цена та же: {current_price}")
     else:
-        send_telegram(f"✅ Мониторинг запущен!\n\nЦена: {current_price:,}\n\n🔗 <a href='{TOUR_URL}'>Открыть тур</a>")
+        send_telegram(f"✅ Мониторинг запущен!\n\nЦена тура: {current_price:,}\n\n🔗 <a href='{TOUR_URL}'>Открыть тур</a>")
         send_telegram_photo("screenshot.png", "📸 Страница")
 
     history["prices"].append({"price": current_price, "timestamp": datetime.now().isoformat()})
